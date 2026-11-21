@@ -1,0 +1,36 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Actions pinned by commit SHA: actions/checkout v7.0.1, actions/setup-node v7.1.0.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.21.1
+      - name: Install (no lifecycle scripts)
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.5.3 --activate
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        run: pnpm test
+      - name: Build and inspect the package
+        run: |
+          pnpm build
+          pnpm smoke
+          pnpm pack --dry-run

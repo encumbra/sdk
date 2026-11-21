@@ -1,0 +1,4 @@
+# Install policy: exact pins, no lifecycle scripts, 3-day minimum release age.
+minimumReleaseAge: 4320
+onlyBuiltDependencies: []
+verifyDepsBeforeRun: false

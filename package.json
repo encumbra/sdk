@@ -1,0 +1,83 @@
+{
+  "name": "@encumbra/sdk",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "viem-based client for the Encumbra lien protocol: read lien, governance and keeper-bond state, prepare unsigned calls, build the agent's EIP-712 authorizations, and pay or serve HTTP resources over x402 from a credit line.",
+  "license": "Apache-2.0",
+  "homepage": "https://encumbra.ai/docs/sdk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/encumbra/sdk.git"
+  },
+  "bugs": {
+    "url": "https://github.com/encumbra/sdk/issues"
+  },
+  "keywords": [
+    "encumbra",
+    "lien",
+    "credit",
+    "viem",
+    "ethereum",
+    "evm",
+    "base",
+    "eip-712",
+    "x402"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./abi": {
+      "types": "./src/abi.ts",
+      "import": "./src/abi.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js",
+        "default": "./dist/index.js"
+      },
+      "./abi": {
+        "types": "./dist/abi.d.ts",
+        "import": "./dist/abi.js",
+        "default": "./dist/abi.js"
+      },
+      "./package.json": "./package.json"
+    },
+    "main": "./dist/index.js",
+    "module": "./dist/index.js",
+    "types": "./dist/index.d.ts"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json && node scripts/fix-dts-extensions.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "prepack": "pnpm run build && pnpm run smoke",
+    "gen:abi": "node scripts/gen-abi.ts",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "2.58.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.8.3"
+  }
+}
