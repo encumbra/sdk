@@ -1,6 +1,7 @@
 // x402 v2 paid from a lien, against an in-memory ledger that applies the contract's rules for
 // charges and vouchers (signature, nonce, deadline, room, freeze, creditor), so it runs with no
 // chain or RPC endpoint.
+import { createServer, type IncomingMessage } from "node:http";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { recoverTypedDataAddress, zeroAddress, type Address, type Hex, type TransactionReceipt } from "viem";
@@ -11,6 +12,7 @@ import {
   SCHEME_LIEN,
   SCHEME_VOUCHER,
   X402_ERRORS as ERRORS,
+  X402PayerRefusal,
   HEADER_RESPONSE,
   HEADER_SIGNATURE,
   VoucherMeter,
@@ -27,6 +29,8 @@ import {
   type ChargeAuth,
   type EncumbraDomain,
   type LienView,
+  type PaymentPayload,
+  type PaymentRequired,
   type PaymentRequirements,
   type SettleVouchersResult,
   type SettlementResponse,
@@ -176,7 +180,8 @@ async function lienServer(creditLimit = 30n * U, price = 10n * U) {
   const chain = new Ledger();
   const id = chain.open({ creditLimit });
   const server = await serveMeteredResource({ encumbra: chain, price, asset: USDC, creditor: CREDITOR, handle: (q) => ({ q: q.get("q") }) });
-  const payer = (signer = agent, lienId = id) => new LienPayer({ lienId, signer, prefer: SCHEME_LIEN, now: () => chain.time });
+  const payer = (signer = agent, lienId = id) =>
+    new LienPayer({ lienId, signer, prefer: SCHEME_LIEN, now: () => chain.time, maxAmountPerRequest: price, expectedVerifyingContract: CONTRACT });
   return { chain, id, server, payer, price };
 }
 
@@ -187,7 +192,8 @@ async function voucherServer(opts: { creditLimit?: bigint; liens?: number; maxUn
   const sign = (id: bigint, cumulative: bigint, who = agent, deadline?: bigint) => signVoucher(who, DOMAIN, { id, cumulative, deadline: deadline ?? chain.time + 86_400n });
   const serve = (handle: () => unknown = () => ({})) =>
     serveMeteredResource({ encumbra: chain, price: 10_000n, asset: USDC, creditor: CREDITOR, handle, meter, offerLien: false });
-  const payer = (id: bigint, signer = agent) => new LienPayer({ lienId: id, signer, now: () => chain.time });
+  const payer = (id: bigint, signer = agent, resumeCumulative?: bigint) =>
+    new LienPayer({ lienId: id, signer, now: () => chain.time, maxAmountPerRequest: 10_000n, expectedVerifyingContract: CONTRACT, resumeCumulative });
   return { chain, ids, meter, sign, serve, payer, PRICE: 10_000n };
 }
 
@@ -277,7 +283,7 @@ test("encumbra-lien: a lien in another token, or an expired authorization, is re
   const { chain, server } = await lienServer();
   try {
     const wrongToken = chain.open({ creditLimit: 60n * U, debtToken: OTHER });
-    const r1 = await new LienPayer({ lienId: wrongToken, signer: agent, prefer: SCHEME_LIEN, now: () => chain.time }).get(`${server.url}/feed`);
+    const r1 = await new LienPayer({ lienId: wrongToken, signer: agent, prefer: SCHEME_LIEN, now: () => chain.time, maxAmountPerRequest: 10n * U, expectedVerifyingContract: CONTRACT }).get(`${server.url}/feed`);
     assert.equal(r1.settlement?.errorReason, ERRORS.lienUnusable);
     assert.match(r1.settlement?.errorMessage ?? "", /different token/);
 
@@ -357,7 +363,12 @@ test("encumbra-voucher: an agent that lost its total is told where to resume; im
     assert.equal(none.required?.accepts[0].extra.servedThrough, undefined);
     const first = payer(id);
     for (let i = 0; i < 3; i++) assert.equal((await first.get(`${server.url}/feed`)).status, 200);
-    const restarted = payer(id);
+    // A restarted payer that kept nothing has signed nothing, so it refuses to jump to the
+    // server's total; one resumed from its persisted total continues from it.
+    const forgetful = payer(id);
+    await assert.rejects(() => forgetful.get(`${server.url}/feed`), { name: "X402PayerRefusal", code: "correction" });
+    assert.equal(forgetful.runningTotal, 0n);
+    const restarted = payer(id, agent, 3n * PRICE);
     const r = await restarted.get(`${server.url}/feed`);
     assert.equal(r.status, 200, r.error);
     assert.equal(r.settlement?.extra?.cumulative, (4n * PRICE).toString());
@@ -438,3 +449,242 @@ test("meter: the unsettled cap, a freeze, batches and a chain that moved ahead",
     assert.equal((await meter.accept(await sign(id, 11n * PRICE), PRICE)).ok, true);
   }
 });
+
+// ---------------------------------------------------------------------------------------
+// A payer facing a hostile resource server
+// ---------------------------------------------------------------------------------------
+
+type Hit = { path: string; signature?: string };
+type Answer = { status: number; headers?: Record<string, string>; body?: unknown };
+
+/** A bare node:http server on an ephemeral port that records every request and its payment header. */
+async function rawServer(answer: (path: string, payment: PaymentPayload | undefined, hits: Hit[], self: string) => Answer) {
+  const hits: Hit[] = [];
+  let self = "";
+  const server = createServer((req: IncomingMessage, res) => {
+    const raw = req.headers[HEADER_SIGNATURE.toLowerCase()];
+    const signature = Array.isArray(raw) ? raw[0] : raw;
+    hits.push({ path: req.url ?? "/", signature });
+    const a = answer(req.url ?? "/", signature ? decodeHeader<PaymentPayload>(signature) : undefined, hits, self);
+    res.writeHead(a.status, { "content-type": "application/json", ...a.headers });
+    res.end(JSON.stringify(a.body ?? {}));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  self = `http://127.0.0.1:${port}`;
+  return { url: self, hits, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+const PRICE = 10_000n;
+const OFFER: PaymentRequirements = {
+  scheme: SCHEME_VOUCHER,
+  network: "eip155:84532",
+  amount: PRICE.toString(),
+  asset: USDC,
+  payTo: CREDITOR,
+  maxTimeoutSeconds: 60,
+  extra: { name: "Encumbra", version: "1", verifyingContract: CONTRACT },
+};
+const challenge = (accepts: PaymentRequirements[], error = "payment required"): Answer => ({
+  status: 402,
+  headers: { "PAYMENT-REQUIRED": encodeHeader({ x402Version: 2, error, resource: { url: "http://x/feed" }, accepts } satisfies PaymentRequired) },
+  body: { error },
+});
+const ok = (payment: PaymentPayload): Answer => ({
+  status: 200,
+  headers: { [HEADER_RESPONSE]: encodeHeader({ success: true, transaction: "", network: payment.accepted.network } satisfies SettlementResponse) },
+  body: { data: "served" },
+});
+
+/** The agent's key behind a counter, to prove a refusal signed nothing. */
+function countingSigner(): { count: number; signTypedData: typeof agent.signTypedData } {
+  const s: { count: number; signTypedData: typeof agent.signTypedData } = {
+    count: 0,
+    signTypedData: ((args: Parameters<typeof agent.signTypedData>[0]) => (s.count++, agent.signTypedData(args))) as typeof agent.signTypedData,
+  };
+  return s;
+}
+
+const guarded = (signer: ReturnType<typeof countingSigner>, extra: Partial<ConstructorParameters<typeof LienPayer>[0]> = {}) =>
+  new LienPayer({ lienId: 1n, signer, now: () => 1_800_000_000n, maxAmountPerRequest: PRICE, expectedVerifyingContract: CONTRACT, ...extra });
+
+const refusal = (code: string) => (e: unknown) => {
+  assert.ok(e instanceof X402PayerRefusal, String(e));
+  assert.equal(e.code, code);
+  return true;
+};
+
+test("a payer refuses an offer that over-asks or names another contract, token, creditor or chain, and signs nothing", async () => {
+  const cases: Array<[string, PaymentRequirements, Partial<ConstructorParameters<typeof LienPayer>[0]>, string]> = [
+    ["over-asks", { ...OFFER, amount: (PRICE + 1n).toString() }, {}, "amount"],
+    ["drains the line", { ...OFFER, amount: (30n * U).toString() }, {}, "amount"],
+    ["not a number", { ...OFFER, amount: "1e9" }, {}, "malformed"],
+    ["another contract", { ...OFFER, extra: { ...OFFER.extra, verifyingContract: OTHER } }, {}, "verifyingContract"],
+    ["another token", { ...OFFER, asset: OTHER }, { expectedAsset: USDC }, "asset"],
+    ["another creditor", { ...OFFER, payTo: SOMEONE_ELSE }, { expectedPayTo: CREDITOR }, "payTo"],
+    ["another chain", { ...OFFER, network: "eip155:1" }, { expectedChainId: 84532n }, "network"],
+    ["lien scheme over-asks", { ...OFFER, scheme: SCHEME_LIEN, amount: (PRICE * 2n).toString() }, { prefer: SCHEME_LIEN }, "amount"],
+    ["a deadline far out", { ...OFFER, scheme: SCHEME_LIEN, maxTimeoutSeconds: 10 ** 9 }, { prefer: SCHEME_LIEN }, "timeout"],
+  ];
+  for (const [label, offer, extra, code] of cases) {
+    const server = await rawServer((_p, payment) => (payment ? ok(payment) : challenge([offer])));
+    try {
+      const signer = countingSigner();
+      await assert.rejects(() => guarded(signer, extra).get(`${server.url}/feed`), refusal(code), label);
+      assert.equal(signer.count, 0, `${label}: nothing signed`);
+      assert.ok(server.hits.every((h) => h.signature === undefined), `${label}: no payment sent`);
+    } finally {
+      await server.close();
+    }
+  }
+});
+
+test("a payer matches the expected addresses case-insensitively and pays an offer within its limits", async () => {
+  const shout = (a: string) => `0x${a.slice(2).toUpperCase()}`;
+  const offer = { ...OFFER, asset: shout(USDC), payTo: shout(CREDITOR), extra: { ...OFFER.extra, verifyingContract: shout(CONTRACT) } };
+  const server = await rawServer((_p, payment) => (payment ? ok(payment) : challenge([offer])));
+  try {
+    const signer = countingSigner();
+    const r = await guarded(signer, { expectedAsset: USDC, expectedPayTo: CREDITOR, expectedChainId: 84532, expectedVerifyingContract: shout(CONTRACT) as Address }).get(`${server.url}/feed`);
+    assert.equal(r.status, 200, r.error);
+    assert.equal(signer.count, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("a corrective 402 cannot raise the price or move the payment to another contract", async () => {
+  for (const [label, bend, code] of [
+    ["raises the price", (o: PaymentRequirements) => ({ ...o, amount: (PRICE * 1000n).toString() }), "amount"],
+    ["another contract", (o: PaymentRequirements) => ({ ...o, extra: { ...o.extra, verifyingContract: OTHER } }), "verifyingContract"],
+  ] as const) {
+    for (const scheme of [SCHEME_VOUCHER, SCHEME_LIEN] as const) {
+      const offer = { ...OFFER, scheme };
+      const correction = (o: PaymentRequirements) =>
+        bend({ ...o, extra: { ...o.extra, lienId: "1", ...(scheme === SCHEME_LIEN ? { chargeNonce: "4" } : { servedThrough: "0" }) } });
+      const server = await rawServer((_p, payment) => (payment ? challenge([correction(offer)], "stale") : challenge([offer])));
+      try {
+        const signer = countingSigner();
+        await assert.rejects(() => guarded(signer, { prefer: scheme }).get(`${server.url}/feed`), refusal(code), `${scheme} ${label}`);
+        assert.equal(signer.count, 1, `${scheme} ${label}: only the original offer was signed`);
+      } finally {
+        await server.close();
+      }
+    }
+  }
+});
+
+test("an inflated servedThrough is refused; a correction within what the payer signed is adopted", async () => {
+  let served = 0n;
+  let claim: bigint | undefined;
+  const server = await rawServer((_p, payment) => {
+    if (!payment) return challenge([OFFER]);
+    const cumulative = BigInt((payment.payload as { cumulative: string }).cumulative);
+    if (claim !== undefined && cumulative !== claim + PRICE) {
+      return challenge([{ ...OFFER, extra: { ...OFFER.extra, lienId: "1", servedThrough: claim.toString() } }], "voucher behind");
+    }
+    served = cumulative;
+    return ok(payment);
+  });
+  try {
+    const signer = countingSigner();
+    const p = guarded(signer);
+    for (let i = 0; i < 3; i++) assert.equal((await p.get(`${server.url}/feed`)).status, 200);
+    assert.equal(p.runningTotal, 3n * PRICE);
+
+    claim = 1000n * PRICE; // the server claims far more than this payer ever signed
+    await assert.rejects(() => p.get(`${server.url}/feed`), refusal("correction"));
+    assert.equal(signer.count, 4, "the refused correction was never signed");
+    assert.equal(p.runningTotal, 3n * PRICE);
+
+    claim = 2n * PRICE; // behind what was signed: re-signing at 3 * PRICE exposes nothing new
+    const r = await p.get(`${server.url}/feed`);
+    assert.equal(r.status, 200, r.error);
+    assert.equal(served, 3n * PRICE);
+    assert.equal(p.runningTotal, 3n * PRICE);
+  } finally {
+    await server.close();
+  }
+});
+
+test("maxCumulative caps what a payer signs in total, for vouchers, corrections and charges", async () => {
+  const server = await rawServer((_p, payment) => (payment ? ok(payment) : challenge([OFFER, { ...OFFER, scheme: SCHEME_LIEN }])));
+  try {
+    for (const scheme of [SCHEME_VOUCHER, SCHEME_LIEN] as const) {
+      const signer = countingSigner();
+      const p = guarded(signer, { prefer: scheme, maxCumulative: 2n * PRICE });
+      for (let i = 0; i < 2; i++) assert.equal((await p.get(`${server.url}/feed`)).status, 200, scheme);
+      await assert.rejects(() => p.get(`${server.url}/feed`), refusal("cumulative"), scheme);
+      assert.equal(signer.count, 2, `${scheme}: the third request was not signed`);
+    }
+  } finally {
+    await server.close();
+  }
+  let fresh = true;
+  const correcting = await rawServer((_p, payment) => {
+    if (!payment) return challenge([OFFER]);
+    if (fresh) return ok(payment);
+    return challenge([{ ...OFFER, extra: { ...OFFER.extra, lienId: "1", servedThrough: (2n * PRICE).toString() } }], "voucher behind");
+  });
+  try {
+    const signer = countingSigner();
+    const p = guarded(signer, { maxCumulative: 2n * PRICE, resumeCumulative: 2n * PRICE });
+    fresh = false;
+    // resumed at the cap: the first voucher would already exceed it
+    await assert.rejects(() => p.get(`${correcting.url}/feed`), refusal("cumulative"));
+    assert.equal(signer.count, 0);
+  } finally {
+    await correcting.close();
+  }
+});
+
+test("LienPayer requires its spending limits at construction", () => {
+  const base = { lienId: 1n, signer: agent };
+  assert.throws(() => new LienPayer({ ...base, expectedVerifyingContract: CONTRACT } as never), /maxAmountPerRequest/);
+  assert.throws(() => new LienPayer({ ...base, maxAmountPerRequest: PRICE } as never), /expectedVerifyingContract/);
+  assert.throws(() => new LienPayer({ ...base, maxAmountPerRequest: PRICE, expectedVerifyingContract: "0x1234" as Address }), /expectedVerifyingContract/);
+  assert.throws(() => new LienPayer({ ...base, maxAmountPerRequest: -1n, expectedVerifyingContract: CONTRACT }), /maxAmountPerRequest/);
+});
+
+test("x402Fetch keeps a payment on its origin: same-origin redirects are followed, a cross-origin one is returned unfollowed", async () => {
+  const thief = await rawServer(() => ({ status: 200, body: { data: "thanks" } }));
+  const origin = await rawServer((path, payment) => {
+    if (path === "/away") return { status: 302, headers: { location: `${thief.url}/collect` } };
+    if (path === "/hop") return { status: 307, headers: { location: "/away" } };
+    if (path === "/moved") return { status: 301, headers: { location: "/feed" } };
+    if (path === "/loop") return { status: 302, headers: { location: "/loop" } };
+    return payment ? ok(payment) : challenge([OFFER]);
+  });
+  try {
+    const payment = await signVoucherPaymentFor(OFFER);
+    const away = await x402Fetch(`${origin.url}/away`, payment);
+    assert.equal(away.status, 302);
+    assert.equal(away.location, `${thief.url}/collect`);
+    const viaHop = await x402Fetch(`${origin.url}/hop`, payment);
+    assert.equal(viaHop.status, 302, "a same-origin hop that then leaves the origin stops there");
+    assert.equal(thief.hits.length, 0, "the other origin was never contacted");
+
+    const moved = await x402Fetch(`${origin.url}/moved`, payment);
+    assert.equal(moved.status, 200);
+    assert.equal(moved.data, "served");
+    assert.ok(origin.hits.some((h) => h.path === "/feed" && h.signature), "the payment followed the same-origin redirect");
+
+    const loop = await x402Fetch(`${origin.url}/loop`, payment);
+    assert.equal(loop.status, 302);
+    assert.match(loop.error ?? "", /too many redirects/);
+    assert.ok(origin.hits.filter((h) => h.path === "/loop").length <= 6, "redirects are bounded");
+
+    const signer = countingSigner();
+    const r = await guarded(signer).get(`${origin.url}/away`);
+    assert.equal(r.status, 302);
+    assert.equal(thief.hits.length, 0);
+  } finally {
+    await origin.close();
+    await thief.close();
+  }
+});
+
+async function signVoucherPaymentFor(req: PaymentRequirements): Promise<PaymentPayload> {
+  const v = await signVoucher(agent, DOMAIN, { id: 1n, cumulative: BigInt(req.amount), deadline: 1_900_000_000n });
+  return { x402Version: 2, accepted: req, payload: { lienId: "1", cumulative: v.cumulative.toString(), deadline: v.deadline.toString(), ref: v.ref, signature: voucherSignature(v) } };
+}

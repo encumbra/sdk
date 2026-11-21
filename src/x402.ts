@@ -403,21 +403,57 @@ export type X402Response = {
   settlement?: SettlementResponse;
   /** The server's error text, if any. */
   error?: string;
+  /** On a redirect that was not followed: where it pointed. */
+  location?: string;
 };
 
-/** One HTTP GET, optionally carrying a payment. Decodes the x402 headers of the answer. */
+/** Same-origin redirects {@link x402Fetch} follows before it returns the redirect itself. */
+export const MAX_REDIRECTS = 5;
+
+/**
+ * One HTTP GET, optionally carrying a payment. Decodes the x402 headers of the answer.
+ *
+ * A payment is a bearer signature, so it never leaves the origin of `url`: redirects are taken
+ * manually, a same-origin redirect is followed (at most {@link MAX_REDIRECTS} times, the
+ * payment re-sent), and a redirect to any other origin is returned unfollowed, with its target
+ * in `location`. In a browser, where a manual redirect is opaque, every redirect is returned
+ * unfollowed with status 0.
+ */
 export async function x402Fetch(url: string, payment?: PaymentPayload): Promise<X402Response> {
-  const r = await fetch(url, { headers: payment ? { [HEADER_SIGNATURE]: encodeHeader(payment) } : {} });
-  const body = (await r.json().catch(() => ({}))) as { data?: unknown; error?: string };
-  const req = r.headers.get(HEADER_REQUIRED);
-  const resp = r.headers.get(HEADER_RESPONSE);
-  return {
-    status: r.status,
-    data: body?.data,
-    error: body?.error,
-    required: req ? decodeHeader<PaymentRequired>(req) : undefined,
-    settlement: resp ? decodeHeader<SettlementResponse>(resp) : undefined,
-  };
+  const origin = new URL(url).origin;
+  const headers: Record<string, string> = payment ? { [HEADER_SIGNATURE]: encodeHeader(payment) } : {};
+  let target = url;
+  for (let hops = 0; ; hops++) {
+    const r = await fetch(target, { headers, redirect: "manual" });
+    if ((r.type as string) === "opaqueredirect") {
+      return { status: r.status, error: "redirect not followed: its target is hidden from this runtime" };
+    }
+    const location = r.status >= 300 && r.status < 400 ? r.headers.get("location") : null;
+    if (location !== null) {
+      const next = new URL(location, target);
+      if (next.origin === origin && hops < MAX_REDIRECTS) {
+        await r.body?.cancel().catch(() => undefined);
+        target = next.toString();
+        continue;
+      }
+      await r.body?.cancel().catch(() => undefined);
+      return {
+        status: r.status,
+        location: next.toString(),
+        error: next.origin === origin ? "too many redirects" : "redirect to another origin not followed",
+      };
+    }
+    const body = (await r.json().catch(() => ({}))) as { data?: unknown; error?: string };
+    const req = r.headers.get(HEADER_REQUIRED);
+    const resp = r.headers.get(HEADER_RESPONSE);
+    return {
+      status: r.status,
+      data: body?.data,
+      error: body?.error,
+      required: req ? decodeHeader<PaymentRequired>(req) : undefined,
+      settlement: resp ? decodeHeader<SettlementResponse>(resp) : undefined,
+    };
+  }
 }
 
 /** Agent side: the payload for `encumbra-lien`, a signed Charge of `req.amount`. */
@@ -475,6 +511,34 @@ export type LienPayerOptions = {
   lienId: bigint;
   /** The lien's agent. */
   signer: TypedDataSigner;
+  /**
+   * The most one request may cost, in atomic units of the debt token. An offer or correction
+   * asking more is refused before anything is signed.
+   */
+  maxAmountPerRequest: bigint;
+  /**
+   * The Encumbra lien contract the agent signs for (the EIP-712 `verifyingContract`). An offer
+   * naming any other contract is refused before anything is signed.
+   */
+  expectedVerifyingContract: Address;
+  /** The debt token the agent expects to pay in. When set, an offer in another token is refused. */
+  expectedAsset?: Address;
+  /** The creditor the agent expects to pay. When set, an offer owed to another address is refused. */
+  expectedPayTo?: Address;
+  /** The chain the agent expects to pay on. When set, an offer on another CAIP-2 network is refused. */
+  expectedChainId?: bigint | number;
+  /**
+   * The most this payer signs for in total: the voucher running total, and separately the sum
+   * of the Charges it signs. Unset, the lien's own credit limit is the only bound.
+   */
+  maxCumulative?: bigint;
+  /**
+   * The voucher total this agent already signed for this lien, e.g. `runningTotal` persisted
+   * from an earlier run. The payer continues from it. A server correction is only adopted when
+   * it does not exceed what this payer has signed, so a payer restarted without it refuses a
+   * correction that resumes a higher total.
+   */
+  resumeCumulative?: bigint;
   /** Scheme to pay with when the server offers both. Default: voucher, the cheaper one. */
   prefer?: EncumbraScheme;
   /** Unix seconds; deadlines are counted from it. Defaults to wall time. */
@@ -483,20 +547,76 @@ export type LienPayerOptions = {
   voucherTtlSecs?: bigint;
 };
 
+/** Why a {@link LienPayer} refused to sign. */
+export type PayerRefusalCode =
+  | "scheme"
+  | "malformed"
+  | "amount"
+  | "verifyingContract"
+  | "asset"
+  | "payTo"
+  | "network"
+  | "timeout"
+  | "cumulative"
+  | "correction";
+
+/** Thrown by {@link LienPayer} instead of signing a payment the server asked for that is outside the payer's limits. */
+export class X402PayerRefusal extends Error {
+  readonly code: PayerRefusalCode;
+  constructor(code: PayerRefusalCode, message: string) {
+    super(message);
+    this.name = "X402PayerRefusal";
+    this.code = code;
+  }
+}
+
+/** The longest charge validity a server may ask for (`maxTimeoutSeconds`). */
+export const MAX_CHARGE_TIMEOUT_SECS = 3600;
+
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const UINT = /^(0|[1-9][0-9]*)$/;
+
 /**
  * An agent's x402 client for one lien. It remembers the requirements a URL answered with, so
  * after the first 402 every request carries its payment up front, and it keeps the running
  * voucher total and the next charge nonce itself. When the server corrects either in a 402, it
  * adopts the correction and re-signs once.
+ *
+ * The server chooses what is asked for, so every requirement is checked against the payer's own
+ * limits before anything is signed: the amount against `maxAmountPerRequest` and
+ * `maxCumulative`, the contract against `expectedVerifyingContract`, and the token, creditor
+ * and chain when expected values are set. A requirement outside them throws
+ * {@link X402PayerRefusal} and nothing is signed.
  */
 export class LienPayer {
   private readonly o: LienPayerOptions;
   private readonly known = new Map<string, PaymentRequired>();
-  private cumulative = 0n;
+  private cumulative: bigint;
+  /** The highest voucher total this payer has signed: what a server can already settle. */
+  private signedCumulative: bigint;
+  /** The sum of the Charges this payer has signed. */
+  private signedCharges = 0n;
   private nonce: bigint | null = null;
 
   constructor(opts: LienPayerOptions) {
+    if (typeof opts?.maxAmountPerRequest !== "bigint" || opts.maxAmountPerRequest < 0n) {
+      throw new TypeError("LienPayer: maxAmountPerRequest (a non-negative bigint) is required");
+    }
+    if (typeof opts.expectedVerifyingContract !== "string" || !ADDRESS.test(opts.expectedVerifyingContract)) {
+      throw new TypeError("LienPayer: expectedVerifyingContract (the lien contract address) is required");
+    }
+    for (const k of ["expectedAsset", "expectedPayTo"] as const) {
+      if (opts[k] !== undefined && !ADDRESS.test(opts[k])) throw new TypeError(`LienPayer: ${k} is not an address`);
+    }
+    if (opts.maxCumulative !== undefined && (typeof opts.maxCumulative !== "bigint" || opts.maxCumulative < 0n)) {
+      throw new TypeError("LienPayer: maxCumulative must be a non-negative bigint");
+    }
+    if (opts.resumeCumulative !== undefined && (typeof opts.resumeCumulative !== "bigint" || opts.resumeCumulative < 0n)) {
+      throw new TypeError("LienPayer: resumeCumulative must be a non-negative bigint");
+    }
     this.o = opts;
+    this.cumulative = opts.resumeCumulative ?? 0n;
+    this.signedCumulative = this.cumulative;
   }
 
   /** The voucher total this payer has signed so far. */
@@ -504,6 +624,7 @@ export class LienPayer {
     return this.cumulative;
   }
 
+  /** Fetch `url`, paying from the lien. Throws {@link X402PayerRefusal} rather than sign outside the payer's limits. */
   async get(url: string): Promise<X402Response> {
     const key = url.split("?")[0];
     let required = this.known.get(key);
@@ -522,12 +643,11 @@ export class LienPayer {
         if (req.scheme === SCHEME_LIEN) this.nonce = (this.nonce ?? 0n) + 1n;
         return res;
       }
-      const corrected = res.required?.accepts.find((a) => a.scheme === req!.scheme && a.extra.lienId === this.o.lienId.toString());
-      if (res.status !== 402 || attempt > 0 || !corrected || !this.adopt(corrected)) {
-        if (req.scheme === SCHEME_VOUCHER) this.cumulative -= BigInt(req.amount); // nothing was served for it
-        return res;
-      }
-      if (req.scheme === SCHEME_VOUCHER) this.cumulative -= BigInt(req.amount);
+      if (req.scheme === SCHEME_VOUCHER) this.cumulative -= BigInt(req.amount); // nothing was served for it
+      const corrected = res.required?.accepts.find((a) => a.scheme === req!.scheme && a.extra?.lienId === this.o.lienId.toString());
+      if (res.status !== 402 || attempt > 0 || !corrected) return res;
+      this.check(corrected);
+      if (!this.adopt(corrected)) return res;
       req = corrected;
     }
   }
@@ -537,37 +657,87 @@ export class LienPayer {
     return ours.find((a) => a.scheme === (this.o.prefer ?? SCHEME_VOUCHER)) ?? ours[0];
   }
 
-  /** Take a server correction for this lien. False if it corrects nothing this payer tracks. */
+  /** Throws unless `req` is within this payer's limits. Runs before every signature. */
+  private check(req: PaymentRequirements): void {
+    const refuse = (code: PayerRefusalCode, why: string): never => {
+      throw new X402PayerRefusal(code, `refused to sign: ${why}`);
+    };
+    if (req.scheme !== SCHEME_VOUCHER && req.scheme !== SCHEME_LIEN) refuse("scheme", `scheme ${String(req.scheme)} is not an Encumbra scheme`);
+    if (typeof req.amount !== "string" || !UINT.test(req.amount)) refuse("malformed", "amount is not a decimal integer");
+    if (!req.extra || typeof req.extra.verifyingContract !== "string" || !ADDRESS.test(req.extra.verifyingContract)) refuse("malformed", "verifyingContract is not an address");
+    if (typeof req.asset !== "string" || !ADDRESS.test(req.asset) || typeof req.payTo !== "string" || !ADDRESS.test(req.payTo)) refuse("malformed", "asset or payTo is not an address");
+    let chainId: bigint;
+    try {
+      chainId = chainIdOf(String(req.network));
+    } catch {
+      return refuse("network", `network ${String(req.network)} is not an EVM chain`);
+    }
+    if (BigInt(req.amount) > this.o.maxAmountPerRequest) refuse("amount", `amount ${req.amount} exceeds maxAmountPerRequest ${this.o.maxAmountPerRequest}`);
+    if (!same(req.extra.verifyingContract, this.o.expectedVerifyingContract)) refuse("verifyingContract", `verifyingContract ${req.extra.verifyingContract} is not the expected contract`);
+    if (this.o.expectedAsset !== undefined && !same(req.asset, this.o.expectedAsset)) refuse("asset", `asset ${req.asset} is not the expected token`);
+    if (this.o.expectedPayTo !== undefined && !same(req.payTo, this.o.expectedPayTo)) refuse("payTo", `payTo ${req.payTo} is not the expected creditor`);
+    if (this.o.expectedChainId !== undefined && chainId !== BigInt(this.o.expectedChainId)) refuse("network", `network ${req.network} is not the expected chain`);
+    if (req.scheme === SCHEME_LIEN && (!Number.isSafeInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0 || req.maxTimeoutSeconds > MAX_CHARGE_TIMEOUT_SECS)) {
+      refuse("timeout", `maxTimeoutSeconds ${String(req.maxTimeoutSeconds)} is outside 1..${MAX_CHARGE_TIMEOUT_SECS}`);
+    }
+  }
+
+  /**
+   * Take a server correction for this lien. False if it corrects nothing this payer tracks.
+   * A voucher correction may only resume from a total this payer has already signed.
+   */
   private adopt(c: PaymentRequirements): boolean {
     if (c.scheme === SCHEME_LIEN && c.extra.chargeNonce !== undefined) {
+      if (!UINT.test(String(c.extra.chargeNonce))) throw new X402PayerRefusal("correction", "refused to sign: chargeNonce is not a decimal integer");
       this.nonce = BigInt(c.extra.chargeNonce);
       return true;
     }
-    if (c.scheme === SCHEME_VOUCHER && c.extra.servedThrough !== undefined && BigInt(c.extra.servedThrough) !== this.cumulative - BigInt(c.amount)) {
-      this.cumulative = BigInt(c.extra.servedThrough) + BigInt(c.amount);
+    if (c.scheme === SCHEME_VOUCHER && c.extra.servedThrough !== undefined) {
+      if (!UINT.test(String(c.extra.servedThrough))) throw new X402PayerRefusal("correction", "refused to sign: servedThrough is not a decimal integer");
+      const served = BigInt(c.extra.servedThrough);
+      if (served === this.cumulative) return false;
+      if (served > this.signedCumulative) {
+        throw new X402PayerRefusal("correction", `refused to sign: servedThrough ${served} exceeds the ${this.signedCumulative} this payer has signed`);
+      }
+      if (this.o.maxCumulative !== undefined && served + BigInt(c.amount) > this.o.maxCumulative) {
+        throw new X402PayerRefusal("cumulative", `refused to sign: resuming from ${served} would exceed maxCumulative ${this.o.maxCumulative}`);
+      }
+      this.cumulative = served;
       return true;
     }
     return false;
   }
 
   private async pay(req: PaymentRequirements, resource: ResourceInfo): Promise<PaymentPayload> {
+    this.check(req);
+    const amount = BigInt(req.amount);
+    const cap = this.o.maxCumulative;
     const now = BigInt(await (this.o.now ?? (() => Math.floor(Date.now() / 1000)))());
     if (req.scheme === SCHEME_VOUCHER) {
-      this.cumulative += BigInt(req.amount);
-      return signVoucherPayment(req, {
+      const next = this.cumulative + amount;
+      if (cap !== undefined && next > cap) throw new X402PayerRefusal("cumulative", `refused to sign: voucher total ${next} would exceed maxCumulative ${cap}`);
+      const payload = await signVoucherPayment(req, {
         lienId: this.o.lienId,
-        cumulative: this.cumulative,
+        cumulative: next,
         deadline: now + (this.o.voucherTtlSecs ?? 86_400n),
         signer: this.o.signer,
         resource,
       });
+      this.cumulative = next;
+      if (next > this.signedCumulative) this.signedCumulative = next;
+      return payload;
     }
-    return signLienPayment(req, {
+    if (cap !== undefined && this.signedCharges + amount > cap) {
+      throw new X402PayerRefusal("cumulative", `refused to sign: charges totalling ${this.signedCharges + amount} would exceed maxCumulative ${cap}`);
+    }
+    const payload = await signLienPayment(req, {
       lienId: this.o.lienId,
       nonce: this.nonce ?? 0n,
       deadline: now + BigInt(req.maxTimeoutSeconds),
       signer: this.o.signer,
       resource,
     });
+    this.signedCharges += amount;
+    return payload;
   }
 }
