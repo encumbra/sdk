@@ -138,33 +138,59 @@ Encumbra offers two x402 v2 schemes, both drawn on a lien instead of a prepaid b
 - `encumbra-voucher`: the agent signs a cumulative voucher per request. The server verifies it locally and serves with no chain call; the creditor settles the latest voucher per lien later, in one transaction for any number of requests.
 - `encumbra-lien`: the agent signs one EIP-712 `Charge` per request, which the server submits with `chargeWithAuth` before serving.
 
-`LienPayer` is the agent side. It remembers what each URL accepts, keeps the running voucher total and the next charge nonce, and re-signs once when the server sends a correction:
+`LienPayer` is the agent side. It remembers what each URL accepts, keeps the running voucher total and the next charge nonce, and re-signs once when the server sends a correction.
+
+The resource server decides what it asks for, so the payer checks every requirement against limits you set before it signs anything. Two are required:
+
+- `maxAmountPerRequest`: the most one request may cost, in atomic units of the debt token (`10_000n` is 0.01 USDC).
+- `expectedVerifyingContract`: the `EncumbraLien` address the agent signs for, from the Networks page.
+
+Optional, and recommended when you know them: `expectedAsset` (the debt token), `expectedPayTo` (the creditor), `expectedChainId`, and `maxCumulative`, a cap on the total this payer signs (the voucher running total, and separately the sum of the Charges it signs). A requirement outside these limits, including one in a server's corrective 402, throws `X402PayerRefusal` with a `code` (`amount`, `verifyingContract`, `asset`, `payTo`, `network`, `timeout`, `cumulative`, `correction`, `scheme` or `malformed`) and nothing is signed. Addresses are compared case-insensitively.
+
+A voucher correction is adopted only when it does not exceed the total this payer has already signed. To continue a running total after a restart, persist `runningTotal` and pass it back as `resumeCumulative`.
 
 ```ts
+import type { Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { LienPayer, SCHEME_LIEN, x402Fetch } from "@encumbra/sdk";
+import { BASE_SEPOLIA_USDC, LienPayer, SCHEME_LIEN, X402PayerRefusal, x402Fetch } from "@encumbra/sdk";
 
 const agent = privateKeyToAccount(process.env.AGENT_KEY as `0x${string}`);
+const LIEN_REGISTRY: Address = "0x0000000000000000000000000000000000000000"; // EncumbraLien, from the Networks page
+const CREDITOR: Address = "0x00000000000000000000000000000000000000c1"; // the API you pay
 
 // See what a resource accepts, without paying.
 const probe = await x402Fetch("https://api.example.com/quote?symbol=ETH");
 if (probe.status === 402) console.log(probe.required?.accepts);
 
-// Pay from lien #7. Vouchers are preferred when offered; SCHEME_LIEN pays one Charge per request.
-const payer = new LienPayer({ lienId: 7n, signer: agent });
-const res = await payer.get("https://api.example.com/quote?symbol=ETH");
-if (res.status === 200) {
-  console.log(res.data, res.settlement);
-} else {
-  console.log(res.status, res.settlement?.errorReason ?? res.error);
+// Pay from lien #7: at most 0.01 USDC a request and 5 USDC in total, only to this creditor on Base Sepolia.
+// Vouchers are preferred when offered; SCHEME_LIEN pays one Charge per request.
+const limits = {
+  maxAmountPerRequest: 10_000n,
+  expectedVerifyingContract: LIEN_REGISTRY,
+  expectedAsset: BASE_SEPOLIA_USDC,
+  expectedPayTo: CREDITOR,
+  expectedChainId: 84532,
+  maxCumulative: 5_000_000n,
+};
+const payer = new LienPayer({ lienId: 7n, signer: agent, ...limits });
+try {
+  const res = await payer.get("https://api.example.com/quote?symbol=ETH");
+  if (res.status === 200) {
+    console.log(res.data, res.settlement);
+  } else {
+    console.log(res.status, res.settlement?.errorReason ?? res.error);
+  }
+} catch (e) {
+  if (e instanceof X402PayerRefusal) console.log("refused to sign:", e.code, e.message);
+  else throw e;
 }
-console.log("signed so far:", payer.runningTotal);
+console.log("signed so far:", payer.runningTotal); // persist it, then pass it back as resumeCumulative
 
-const perRequest = new LienPayer({ lienId: 7n, signer: agent, prefer: SCHEME_LIEN });
+const perRequest = new LienPayer({ lienId: 7n, signer: agent, prefer: SCHEME_LIEN, ...limits });
 console.log((await perRequest.get("https://api.example.com/quote?symbol=BTC")).status);
 ```
 
-`x402Fetch` performs a single GET and decodes the `PAYMENT-REQUIRED` and `PAYMENT-RESPONSE` headers. For a custom HTTP stack, `signVoucherPayment` and `signLienPayment` build the payload and `encodeHeader` / `decodeHeader` handle the header encoding.
+`x402Fetch` performs a single GET and decodes the `PAYMENT-REQUIRED` and `PAYMENT-RESPONSE` headers. A payment never leaves the origin it was made for: redirects are handled manually, a same-origin redirect is followed (at most `MAX_REDIRECTS`, 5) with the payment re-sent, and a redirect to another origin is returned unfollowed, with its target in `location`. In a browser, where a manual redirect is opaque, every redirect is returned unfollowed with status 0. For a custom HTTP stack, `signVoucherPayment` and `signLienPayment` build the payload and `encodeHeader` / `decodeHeader` handle the header encoding; those functions sign what they are given, so apply the same checks before calling them.
 
 ## x402: serving a metered resource
 
